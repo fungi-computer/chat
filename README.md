@@ -1,11 +1,11 @@
-# @fungi-computer/chat
+# @fungi.computer/chat
 
 React + Jotai client for `@shiit/coding-agent`. Renders the agent timeline (messages, tool calls, file ops) and exposes a transport-agnostic store you can wire to any `AgentSessionServer`.
 
 ## Install
 
 ```bash
-npm install @fungi-computer/chat
+npm install @fungi.computer/chat
 ```
 
 `react`, `react-dom`, and `@shiit/coding-agent` are peer or runtime deps — install them too.
@@ -20,7 +20,7 @@ import {
   chatStore,
   connectToSession,
   sendAbort,
-} from "@fungi-computer/chat";
+} from "@fungi.computer/chat";
 import {
   AgentSessionClient,
   WebSocketClientTransport,
