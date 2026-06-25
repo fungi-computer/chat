@@ -25,6 +25,16 @@ export type ConnectionListener = (event: ConnectionEvent) => void;
 export interface ConnectionState {
   connected: boolean;
   error: null | string;
+  /**
+   * The server's last-broadcast team version. PLAN-016 PR 3: the
+   * server pushes `{ type: "version", version: N }` whenever a
+   * team-scoped write happens (workspace attach/detach, project
+   * create/delete). The chat compares this to its `lastSeenVersion`
+   * to detect a stale view; if the server is ahead, the dashboard
+   * re-fetches the assembled view via the agent DO's `getView`
+   * action.
+   */
+  lastSeenVersion: number;
   sessionId: null | string;
   snapshot: null | SessionSnapshot;
 }
@@ -39,6 +49,7 @@ export class AgentConnection {
   private state: ConnectionState = {
     connected: false,
     error: null,
+    lastSeenVersion: 0,
     sessionId: null,
     snapshot: null,
   };
@@ -232,6 +243,18 @@ export class AgentConnection {
         }
         if (data.type === "limit_reached") {
           // Page-specific handling — listener can react to this
+        }
+        if (data.type === "version" && typeof data.version === "number") {
+          // PLAN-016 PR 3: server pushed a version-bump event. The
+          // dashboard's `lastSeenVersion` advances; if the server is
+          // ahead, the dashboard re-fetches the assembled view via
+          // the agent DO's `getView` action (HTTP, not via this
+          // WebSocket — the assembled view is large and only the
+          // projection re-runs are cheap).
+          if (data.version > this.state.lastSeenVersion) {
+            this.state.lastSeenVersion = data.version;
+            this.emitState({ lastSeenVersion: data.version });
+          }
         }
       });
 
