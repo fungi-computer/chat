@@ -118,6 +118,12 @@ export class AgentConnection {
     this.browserWs.onclose = () => {
       console.log("[BrowserWS] Disconnected");
       this.browserWs = null;
+      // If we're already disposed (e.g. the parent called
+      // disconnect()), don't try to reconnect — the new AgentConnection
+      // has its own browserWs. Without this guard, the old connection's
+      // reconnect would race with the new one and the server would
+      // see two browser-side clients for the same agent.
+      if (this.disposed) return;
       setTimeout(() => this.connectBrowser(sessionId), 3000);
     };
 
@@ -132,6 +138,14 @@ export class AgentConnection {
       clearTimeout(this.reconnectTimer);
       this.reconnectTimer = null;
     }
+    // Close the browser WS if we ever opened one. Without this the
+    // WebSocket stays open until the server times it out, and the
+    // onclose handler then tries to reconnect with the stale sessionId
+    // (see onclose below for the disposed check). Disposed gates that
+    // reconnect, but closing here is the right place to actually
+    // release the resource.
+    this.browserWs?.close();
+    this.browserWs = null;
     this.transport?.disconnect();
     this.cleanup();
     this.emitState({ connected: false, error: null, sessionId: null });

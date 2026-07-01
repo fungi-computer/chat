@@ -18,7 +18,44 @@ export interface TimelinePatch {
   cost?: number;
   model?: { name: string; provider: string } | null;
   status?: AgentStatus;
-  timeline?: (prev: TimelineItem[]) => TimelineItem[];
+  /**
+   * Granular timeline patch. The reducer function takes the current
+   * `TimelineItem[]` (for findIndex and similar O(n) lookups during
+   * the reducer's logic) and returns a `TimelineDelta` describing
+   * what to change in the family + order atoms. The consumer
+   * (chat-store) applies the delta to the underlying atoms, so a
+   * streaming `message_update` is O(1) on the family write and
+   * does NOT change the order atom, which means Virtuoso's `data`
+   * prop is stable across streaming tokens and `TimelineItemRenderer`
+   * for unchanged ids does NOT re-render.
+   *
+   * If `undefined`, the event does not touch the timeline (e.g.
+   * `agent_start`, `auto_retry_start` without a timeline change).
+   */
+  timeline?: (prev: TimelineItem[]) => TimelineDelta | null;
+}
+
+/**
+ * Result of a timeline reducer. Apply with `chatStore.set`:
+ *
+ *   - `setItems`: upsert items by id. The consumer writes to the
+ *     `timelineItemAtomFamily(id)` atom for each entry. O(1) per
+ *     id; only subscribers of those specific ids re-render.
+ *   - `removeItems`: remove items from the family. The consumer
+ *     also drops them from the order if present.
+ *   - `order`: the new full order array. Only set on insert/remove.
+ *     O(n) write, but `n` is the timeline length (small) and the
+ *     write is amortized over many streaming tokens that don't
+ *     touch this field.
+ *
+ * If both `setItems`/`removeItems` and `order` are present, the
+ * consumer applies them atomically (order last, so any re-render
+ * triggered by setItems sees a consistent order).
+ */
+export interface TimelineDelta {
+  order?: string[];
+  removeItems?: string[];
+  setItems?: Array<{ id: string; item: TimelineItem }>;
 }
 
 export function interpretEvent(
@@ -41,16 +78,22 @@ export function interpretEvent(
                   i.kind === "assistant_message" &&
                   i.text === lastMsg.errorMessage,
               );
-              if (exists) return prev;
-              return [
-                ...prev,
-                {
-                  id: `error-${Date.now()}`,
-                  kind: "assistant_message",
-                  pending: false,
-                  text: lastMsg.errorMessage,
-                } as TimelineItem,
-              ];
+              if (exists) return null;
+              // `lastMsg.errorMessage` is typed as optional, but the
+              // outer `if (lastMsg?.role === "assistant" && lastMsg?.errorMessage)`
+              // guard above ensures it's present here. The non-null
+              // assertion is a TS-level affordance for that.
+              const errorText = lastMsg.errorMessage as string;
+              const newItem: AssistantMessageItem = {
+                id: `error-${Date.now()}`,
+                kind: "assistant_message",
+                pending: false,
+                text: errorText,
+              };
+              return {
+                order: [...prev.map((i) => i.id!), newItem.id],
+                setItems: [{ id: newItem.id, item: newItem }],
+              };
             },
           };
         }
@@ -71,15 +114,22 @@ export function interpretEvent(
       return {
         status: "retrying",
         timeline: (prev) => {
-          const filtered = prev.filter((i) => i.kind !== "retry");
-          return [
-            ...filtered,
-            {
-              id: `retry-${Date.now()}`,
-              kind: "retry",
-              text: `Retry ${ev.attempt}/${ev.maxAttempts} — ${ev.errorMessage} (${ev.delayMs}ms)`,
-            },
-          ];
+          const retryIds = prev
+            .filter((i) => i.kind === "retry")
+            .map((i) => i.id);
+          const newItem: TimelineItem = {
+            id: `retry-${Date.now()}`,
+            kind: "retry",
+            text: `Retry ${ev.attempt}/${ev.maxAttempts} — ${ev.errorMessage} (${ev.delayMs}ms)`,
+          };
+          return {
+            removeItems: retryIds,
+            order: [
+              ...prev.filter((i) => i.kind !== "retry").map((i) => i.id),
+              newItem.id,
+            ],
+            setItems: [{ id: newItem.id, item: newItem }],
+          };
         },
       };
     }
@@ -92,25 +142,41 @@ export function interpretEvent(
       };
       if (ev.success) {
         return {
-          timeline: (prev) => prev.filter((i) => i.kind !== "retry"),
+          timeline: (prev) => {
+            const retryIds = prev
+              .filter((i) => i.kind === "retry")
+              .map((i) => i.id);
+            return {
+              removeItems: retryIds,
+              order: prev.filter((i) => i.kind !== "retry").map((i) => i.id),
+            };
+          },
         };
       }
       return {
         status: "idle",
         timeline: (prev) => {
           const filtered = prev.filter((i) => i.kind !== "retry");
+          const retryIds = prev
+            .filter((i) => i.kind === "retry")
+            .map((i) => i.id);
           if (ev.finalError) {
-            return [
-              ...filtered,
-              {
-                id: `error-${Date.now()}`,
-                kind: "assistant_message",
-                pending: false,
-                text: ev.finalError,
-              },
-            ];
+            const newItem: TimelineItem = {
+              id: `error-${Date.now()}`,
+              kind: "assistant_message",
+              pending: false,
+              text: ev.finalError,
+            };
+            return {
+              removeItems: retryIds,
+              order: [...filtered.map((i) => i.id), newItem.id],
+              setItems: [{ id: newItem.id, item: newItem }],
+            };
           }
-          return filtered;
+          return {
+            removeItems: retryIds,
+            order: filtered.map((i) => i.id),
+          };
         },
       };
     }
@@ -121,16 +187,17 @@ export function interpretEvent(
         timeline: (prev) => {
           // Add a synthetic compaction divider when compaction succeeded
           if (!event.aborted && (event as any).result) {
-            return [
-              ...prev,
-              {
-                id: `compaction-${Date.now()}`,
-                kind: "compaction" as const,
-                label: "Context compacted",
-              } as TimelineItem, // cast because 'compaction' is not in the base type yet
-            ];
+            const newItem: TimelineItem = {
+              id: `compaction-${Date.now()}`,
+              kind: "compaction" as const,
+              label: "Context compacted",
+            } as TimelineItem; // cast because 'compaction' is not in the base type yet
+            return {
+              order: [...prev.map((i) => i.id!), newItem.id],
+              setItems: [{ id: newItem.id, item: newItem }],
+            };
           }
-          return prev;
+          return null;
         },
       };
     }
@@ -161,32 +228,39 @@ export function interpretEvent(
           const idx = prev.findIndex(
             (i) => i.kind === "assistant_message" && i.id === event.id,
           );
-          const updated = [...prev];
           if (idx === -1) {
             // Message arrived before snapshot — materialise the final form
-            if (!finalText && !finalThinking && !hasToolCalls) return prev;
-            updated.push({
+            if (!finalText && !finalThinking && !hasToolCalls) return null;
+            const newItem: TimelineItem = {
               id: event.id as string,
               kind: "assistant_message",
               pending: false,
               text: finalText,
               thinking: finalThinking,
-            });
-            return updated;
+            };
+            return {
+              order: [...prev.map((i) => i.id!), newItem.id],
+              setItems: [{ id: newItem.id, item: newItem }],
+            };
           }
           // Don't remove assistant messages that contain tool calls — the
           // thinking/text belongs alongside the tool cards. If it's truly
           // empty (no text, no thinking, no tool calls), then drop it.
           if (!finalText && !finalThinking && !hasToolCalls) {
-            return prev.filter((_, i) => i !== idx);
+            return {
+              removeItems: [event.id as string],
+              order: prev.filter((_, i) => i !== idx).map((i) => i.id),
+            };
           }
-          updated[idx] = {
-            ...(updated[idx] as AssistantMessageItem),
+          const updated: AssistantMessageItem = {
+            ...(prev[idx] as AssistantMessageItem),
             pending: false,
             text: finalText,
             thinking: finalThinking,
           };
-          return updated;
+          return {
+            setItems: [{ id: event.id as string, item: updated }],
+          };
         },
       };
     }
@@ -207,26 +281,52 @@ export function interpretEvent(
               text: extractText(msg.content),
             };
             if (optimisticIdx !== -1) {
-              const updated = [...prev];
-              updated[optimisticIdx] = newItem;
-              return updated;
+              // Replace the optimistic entry. The bug here was: we
+              // nulled the optimistic id's family entry (removeItems)
+              // and added the server's id (setItems), but we did
+              // NOT update the order to swap the ids. The order
+              // still referenced the now-null optimistic id, and the
+              // TimelineItemRenderer returned null on its next
+              // render — the user message disappeared from the
+              // chat list.
+              //
+              // Fix: include a new order array that swaps the
+              // optimistic id for the server's id. We do this
+              // explicitly (instead of `removeItems: [opt]` +
+              // `order: [...].push(server)`) so the order
+              // replacement is atomic — both ids swap in one
+              // setTimelineOrder call.
+              const newOrder = prev.map((i) =>
+                i.id === prev[optimisticIdx]!.id ? newItem.id : i.id,
+              );
+              return {
+                order: newOrder,
+                setItems: [{ id: newItem.id, item: newItem }],
+                removeItems: [prev[optimisticIdx]!.id],
+              };
             }
-            return [...prev, newItem];
+            return {
+              order: [...prev.map((i) => i.id!), newItem.id],
+              setItems: [{ id: newItem.id, item: newItem }],
+            };
           },
         };
       }
       if (msg.role !== "toolResult") {
         return {
           status: "streaming",
-          timeline: (prev) => [
-            ...prev,
-            {
+          timeline: (prev) => {
+            const newItem: TimelineItem = {
               id: event.id as string,
               kind: "assistant_message",
               pending: true,
               text: "",
-            },
-          ],
+            };
+            return {
+              order: [...prev.map((i) => i.id!), newItem.id],
+              setItems: [{ id: newItem.id, item: newItem }],
+            };
+          },
         };
       }
       return null;
@@ -242,12 +342,20 @@ export function interpretEvent(
             idx !== -1 ? (prev[idx] as AssistantMessageItem) : null;
           const isFirstDelta = !existing || existing.text === "";
           const isFirstThinking = !existing || !existing.thinking;
-          const updated = [...prev];
+
+          // Build the setItems array. Streaming text into an existing
+          // message is the hot path — O(1) on the family atom, no
+          // change to the order atom (so Virtuoso's data prop is
+          // stable across streaming tokens), and only the
+          // TimelineItemRenderer for this specific id re-renders.
+          const setItems: Array<{ id: string; item: TimelineItem }> = [];
+          let order: string[] | undefined;
+
           if (idx === -1) {
             // Message arrived before snapshot — materialise it now
             const msg = event.message as any;
-            if (msg.role !== "assistant") return prev;
-            updated.push({
+            if (msg.role !== "assistant") return null;
+            const newItem: TimelineItem = {
               id: event.id as string,
               kind: "assistant_message",
               pending: true,
@@ -255,23 +363,25 @@ export function interpretEvent(
               thinking: event.thinkingDelta
                 ? event.thinkingDelta.trimStart()
                 : undefined,
-            });
+            } as TimelineItem;
+            setItems.push({ id: newItem.id, item: newItem });
+            order = [...prev.map((i) => i.id!), newItem.id];
           } else {
-            const current = prev[idx] as AssistantMessageItem;
-            updated[idx] = {
-              ...current,
+            const nextItem: AssistantMessageItem = {
+              ...(prev[idx] as AssistantMessageItem),
               text:
-                current.text +
+                ((prev[idx] as AssistantMessageItem).text || "") +
                 (isFirstDelta
                   ? (event.delta || "").trimStart()
                   : event.delta || ""),
               thinking: event.thinkingDelta
-                ? (current.thinking || "") +
+                ? ((prev[idx] as AssistantMessageItem).thinking || "") +
                   (isFirstThinking
                     ? event.thinkingDelta.trimStart()
                     : event.thinkingDelta)
-                : current.thinking,
+                : (prev[idx] as AssistantMessageItem).thinking,
             };
+            setItems.push({ id: event.id as string, item: nextItem });
           }
 
           // Extract tool calls from the partial assistant message and
@@ -282,28 +392,31 @@ export function interpretEvent(
           if (content) {
             const toolCalls = content.filter((c) => c.type === "toolCall");
             for (const tc of toolCalls) {
-              const existingIdx = updated.findIndex(
+              const existingIdx = prev.findIndex(
                 (i) => i.kind === "tool" && i.id === tc.id,
               );
               if (existingIdx === -1) {
-                updated.push({
+                const newTool: TimelineItem = {
                   args: safeParseArgs(tc.arguments),
                   id: tc.id,
                   isError: false,
                   kind: "tool",
                   name: tc.name,
                   status: "pending",
-                });
+                };
+                setItems.push({ id: newTool.id, item: newTool });
+                if (!order) order = [...prev.map((i) => i.id!), newTool.id];
               } else {
-                updated[existingIdx] = {
-                  ...(updated[existingIdx] as ToolItem),
+                const updated: ToolItem = {
+                  ...(prev[existingIdx] as ToolItem),
                   args: safeParseArgs(tc.arguments),
                 };
+                setItems.push({ id: tc.id, item: updated });
               }
             }
           }
 
-          return updated;
+          return { order, setItems };
         },
       };
     }
@@ -321,15 +434,14 @@ export function interpretEvent(
           const idx = prev.findIndex(
             (i) => i.kind === "tool" && i.id === event.toolCallId,
           );
-          if (idx === -1) return prev;
-          const updated = [...prev];
-          updated[idx] = {
-            ...(updated[idx] as ToolItem),
+          if (idx === -1) return null;
+          const updated: ToolItem = {
+            ...(prev[idx] as ToolItem),
             isError: event.isError,
             result: event.result,
             status: event.isError ? "error" : "completed",
           };
-          return updated;
+          return { setItems: [{ id: event.toolCallId, item: updated }] };
         },
       };
     }
@@ -342,25 +454,25 @@ export function interpretEvent(
             (i) => i.kind === "tool" && i.id === event.toolCallId,
           );
           if (existingIdx !== -1) {
-            const updated = [...prev];
-            updated[existingIdx] = {
-              ...(updated[existingIdx] as ToolItem),
+            const updated: ToolItem = {
+              ...(prev[existingIdx] as ToolItem),
               args: event.args,
               status: "running",
             };
-            return updated;
+            return { setItems: [{ id: event.toolCallId, item: updated }] };
           }
-          return [
-            ...prev,
-            {
-              args: event.args,
-              id: event.toolCallId,
-              isError: false,
-              kind: "tool",
-              name: event.toolName,
-              status: "running",
-            },
-          ];
+          const newTool: TimelineItem = {
+            args: event.args,
+            id: event.toolCallId,
+            isError: false,
+            kind: "tool",
+            name: event.toolName,
+            status: "running",
+          };
+          return {
+            order: [...prev.map((i) => i.id!), event.toolCallId],
+            setItems: [{ id: event.toolCallId, item: newTool }],
+          };
         },
       };
     }
@@ -371,13 +483,12 @@ export function interpretEvent(
           const idx = prev.findIndex(
             (i) => i.kind === "tool" && i.id === event.toolCallId,
           );
-          if (idx === -1) return prev;
-          const updated = [...prev];
-          updated[idx] = {
-            ...(updated[idx] as ToolItem),
+          if (idx === -1) return null;
+          const updated: ToolItem = {
+            ...(prev[idx] as ToolItem),
             result: event.partialResult,
           };
-          return updated;
+          return { setItems: [{ id: event.toolCallId, item: updated }] };
         },
       };
     }
