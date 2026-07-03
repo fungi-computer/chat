@@ -246,11 +246,11 @@ export class AgentConnection {
         if (data.type === "snapshot" && data.sessionId) {
           clearTimeout(timeout);
           this.rejectSnapshot = null;
-          const msgCount = data.data?.messages?.length ?? 0;
+          const msgCount = data.snapshot?.messages?.length ?? 0;
           console.log(
             `[AgentConnection] Received snapshot for ${data.sessionId}: ${msgCount} messages`,
           );
-          resolveSnapshot(data.data);
+          resolveSnapshot(data.snapshot);
         }
         if (data.type === "limit_reached") {
           // Page-specific handling — listener can react to this
