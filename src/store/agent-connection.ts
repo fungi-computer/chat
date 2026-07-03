@@ -5,6 +5,8 @@ import type {
 
 import {
   AgentSessionClient,
+  parseServerMessage,
+  type ServerMessage,
   WebSocketClientTransport,
 } from "@shiit/coding-agent/client";
 
@@ -238,34 +240,53 @@ export class AgentConnection {
         rejectSnapshot(new Error("Timeout waiting for session snapshot"));
       }, 10000);
 
-      this.transport.onMessage((data: any) => {
-        if (data.type === "welcome" && data.sessionId) {
-          this.state.sessionId = data.sessionId;
-          this.emitState({ sessionId: data.sessionId });
+      this.transport.onMessage((raw: any) => {
+        // PLAN-020: parse the frame into the canonical
+        // `ServerMessage` discriminated union. The transport
+        // hands us the parsed JSON; we route by `type` with an
+        // exhaustive switch. Drift between the wire format
+        // and the type is caught at compile time (the
+        // union) and at test time (`protocol-roundtrip.test.ts`).
+        let msg: ServerMessage;
+        try {
+          msg = parseServerMessage(JSON.stringify(raw));
+        } catch {
+          // Malformed frame. Drop per-WS; the chat will reconnect.
+          return;
         }
-        if (data.type === "snapshot" && data.sessionId) {
-          clearTimeout(timeout);
-          this.rejectSnapshot = null;
-          const msgCount = data.snapshot?.messages?.length ?? 0;
-          console.log(
-            `[AgentConnection] Received snapshot for ${data.sessionId}: ${msgCount} messages`,
-          );
-          resolveSnapshot(data.snapshot);
-        }
-        if (data.type === "limit_reached") {
-          // Page-specific handling — listener can react to this
-        }
-        if (data.type === "version" && typeof data.version === "number") {
-          // PLAN-016 PR 3: server pushed a version-bump event. The
-          // dashboard's `lastSeenVersion` advances; if the server is
-          // ahead, the dashboard re-fetches the assembled view via
-          // the agent DO's `getView` action (HTTP, not via this
-          // WebSocket — the assembled view is large and only the
-          // projection re-runs are cheap).
-          if (data.version > this.state.lastSeenVersion) {
-            this.state.lastSeenVersion = data.version;
-            this.emitState({ lastSeenVersion: data.version });
+        switch (msg.type) {
+          case "welcome":
+            this.state.sessionId = msg.sessionId;
+            this.emitState({ sessionId: msg.sessionId });
+            return;
+          case "snapshot": {
+            clearTimeout(timeout);
+            this.rejectSnapshot = null;
+            const msgCount = msg.snapshot?.messages?.length ?? 0;
+            console.log(
+              `[AgentConnection] Received snapshot for ${msg.sessionId}: ${msgCount} messages`,
+            );
+            resolveSnapshot(msg.snapshot);
+            return;
           }
+          case "version":
+            // PLAN-016 PR 3: server pushed a version-bump event.
+            // The dashboard's `lastSeenVersion` advances; if the
+            // server is ahead, the dashboard re-fetches the
+            // assembled view via the agent DO's `getView` action
+            // (HTTP, not via this WebSocket — the assembled view
+            // is large and only the projection re-runs are cheap).
+            if (msg.version > this.state.lastSeenVersion) {
+              this.state.lastSeenVersion = msg.version;
+              this.emitState({ lastSeenVersion: msg.version });
+            }
+            return;
+          case "event":
+          case "error":
+            // Routed through `client.subscribeSession` (event) or
+            // surfaced as a connection-state error (error). Both
+            // handled by the chat's listener; nothing to do here.
+            return;
         }
       });
 
